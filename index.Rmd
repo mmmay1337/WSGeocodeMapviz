@@ -1,0 +1,238 @@
+---
+title: "Webscraping, geocoding and visualising location data"
+author: "May Phang"
+date: "October 31, 2016"
+output: html_document
+---
+
+## Background and motivation
+
+As part house hunting - 2 key factors that influence the decision making process for some individuals include close proximity to good schools and public transportation. With most corporate jobs being in the CBD, most corporate people commute to work by train. In the state of Victoria, Australia - entry to top schools are dependent on clearly defined "school zones" (housing that lie within a certain proximity from the school). Furthermore, the GMAT - an aptitude test completed by students in their final year of high school is dependent on how the individual school performs overall, influencing the likelihood of a student getting into a good degree/reputable university.
+
+Filtering out for houses by proximity to train stations and schools using real estate websites aren't as straight forward, as they try encouraging you to interact with the displayed listings.
+
+In this post, I will demonstrate how we can collect the relevant location data, and visualise this on a map through a combination of: 
+
+- webscraping HTML tables with the *httr* and *XML R package*
+- geocoding addresses/points of interest with the *ggmap R package*
+- visualise the data using the *leaflet R package*
+
+This in turn provides a starting point to do more interesting things with the geocoded data e.g. using additional data (such as the GNAF data, available on data.gov.au) to identify homes that are within reasonable distance between schools and train stations; understand the level of premium in house prices when located close to these points of interest.
+
+Some notes:
+
+- the ggmap R package gives you the option of geocoding via the Google API, or the Data Science Toolkit (which I have found to be not as accurate)
+- for geocoding purposes, it is preferable to have addresses to be as complete as possible e.g. Melbourne can refer to Melbourne, Florida, US or Melbourne, Victoria, Australia
+- the Google API has a daily allowance of 2,500 addresses a day before it blocks further geocoding
+- I am by no means an expert in web-scraping or geocoding - any advice / suggestions are welcome :-) 
+
+```{r, setup, cache = TRUE, echo = FALSE}
+setwd("C:/Users/ymp/Documents/R/DataProds/WSGeocodeMapviz")
+```
+
+## Data preparation
+
+First, we will need to collect the relevant data - these are the locations we are interested in:
+
+- **train stations**: this can be easily found on Wikipedia (providing a list) in this [link](https://en.wikipedia.org/wiki/List_of_Melbourne_railway_stations).
+- **top performing Victorian public high schools**: based on personal preference for public schools (as private schools can be quite costly), the top 50 performing Victorian public schools for 2015 will be used. This can be found [here](http://bettereducation.com.au/school/secondary/vic/melbourne_top_government_secondary_schools.aspx).
+
+### Webscraping data
+
+Why webscrape? Tables on websites might change from time to time so webscraping makes things easy to collect, without very much human intervention. Web-scraping enables extracting specific elements of a website e.g. tables, numbers, etc. In context to school rankings - this might change from one year to another.
+
+Using the links above, we would like to obtain the largest tables found on the relevant links.
+
+```{r, webscrape, cache = TRUE}
+# create a function that scrapes the largest table (function of row x col) for the relevant URLs
+library(httr); library(XML)
+
+GetTable <- function(urlname) {
+  if(!(substr(urlname, 1, 4) %in% c("http", "www"))) {
+    print("please enter valid URL")
+  } else {
+    urldata <- GET(urlname)
+    data <- readHTMLTable(rawToChar(urldata$content), stringsAsFactors = FALSE)
+    x <- sapply(data, function(x) ifelse(is.null(nrow(x)), 0, nrow(x))) *  # number of rows
+          sapply(data, function(x) ifelse(is.null(ncol(x)), 0, ncol(x)))   # number of columns
+    i <- match(max(x), x) # find which resulting list element has the largest table
+    data[[i]] # returns the table
+  }
+}
+
+trainURL <- "https://en.wikipedia.org/wiki/List_of_Melbourne_railway_stations"
+schoolURL <- "http://bettereducation.com.au/school/secondary/vic/melbourne_top_government_secondary_schools.aspx"
+
+train <- GetTable(trainURL); names(train) <- tolower(names(train))
+school <- GetTable(schoolURL); names(school) <- tolower(names(school))
+```
+
+For the schools table - we will add the relevant ranks to the table, and clean some of the school names so that they are in more or less a standard format.
+
+```{r, school, cache = TRUE, comment=""}
+# add rankings - data has been read in sorted order
+school$rank <- seq(1:50)
+# clean the school names - some contain the suburb and postcode, after the school name
+school$school <- unlist(lapply(strsplit(school$school, split = ","), '[[', 1))
+library(knitr)
+kable(head(train)) # view the first few rows
+kable(head(school))
+```
+
+## Geocoding
+
+Geocoding is the process of identifying the relevant GPS co-ordinates (latitude/longitude) for a given point of interest. In R - this can be achieved through using the geocode function from the ggmap package. By default, the geocode function makes use of Google's geocoding API. As mentioned before - Google restricts the daily limit to be 2,500 queries a day, which is more than sufficient for this exercise.
+
+### Train stations
+
+```{r, geocode, cache = TRUE}
+library(ggmap)
+# geocode the train stations
+train.geo <- suppressMessages(geocode(paste(train$station, "train station, Victoria, Australia", sep = " ")))
+kable(summary(train.geo)) # check that the resulting geocodes are sensible
+```
+
+The resulting range of co-ordinates from the geocode seems sensible (and generally points to Victoria, Australia).
+
+```{r, mergetrain, cache=TRUE}
+train <- cbind(train, train.geo)
+rm(train.geo)
+```
+
+### Schools
+
+As for geocoding school addresses, unfortunately the geocode function did not provide very accurate results (after some manual inspection, this sometimes gave results which were at least 1km away from the actual location!). Luckily, geospatial data on Victorian schools exists on the Victorian Government data website (link [here](https://www.data.vic.gov.au/data/dataset/victorian-schools-location-2015)), noting that this doesn't contain school ranks (hence cannot be used directly).
+
+```{r, geocodeschool, cache = TRUE}
+library(dplyr)
+school.geo <- read.csv("dv165-allschoolslocationlist2015.csv", stringsAsFactors = FALSE)
+names(school.geo) <- tolower(names(school.geo))
+school.geo <- select(school.geo, school = school_name, lat= y, lon = x)
+school <- merge(school, school.geo, all.x = TRUE)
+
+# check if the merge was successful for all schools
+kable(subset(school, is.na(lon)))
+```
+
+There appears to be 4 schools which could not find a match to the comprehensive schools data. A closer look comparing the 2 datasets indicates that there are inconsistent naming conventions.Given it's only 4 schools, we will fix these manually; alternatively if this was much larger a string comparison exercise could have been carried out to perform a 'batch' fix.
+
+```{r, fixschool, cache = TRUE}
+
+for (i in 1:nrow(school)) {
+  if (is.na(school$lat[i])) {
+    school$school[i] <- gsub("Mac Robertson Girls High School", "MacRobertson Girls High School", school$school[i]) %>%
+      gsub("Melbourne Girls' College", "Melbourne Girls College", school$school[i]) %>%
+      gsub("Auburn High School", "Auburn High School (interim name)", school$school[i]) %>%
+      gsub("Keilor Downs College", "Keilor Downs Secondary College", school$school[i])
+  }
+}
+
+# remerge the data
+school <- merge(select(school, -lat, -lon), school.geo, all.x = TRUE)
+kable(summary(select(school, lat, lon))) # check that the resulting geocodes are sensible
+```
+
+The resulting range of the co-ordinates are sensible, when compared against the train co-ordinates.
+
+## Map visualisations
+
+### Filtering the data
+
+We note that there are 50 schools and 209 train stations to be plotted on a map - which may be a bit overwhelming visually. From a personal view, being within a school zone is more important than a train station, hence we will filter out any train stations that lie outside of a 2km radius for a given school.
+
+```{r, filterdata, cache=TRUE}
+suppressMessages(library(raster)) # load package to calculate distance
+
+train.list <- NULL # create a vector of row index to subset the trains data on
+for (i in 1:nrow(school)) {
+  for (j in 1:nrow(train)) {
+    if (abs(pointDistance(c(school$lon[i], school$lat[i]), c(train$lon[j], train$lat[j]), lonlat = TRUE)/1000) < 2) {
+      train.list <- c(train.list, j)
+    }
+  }
+}
+train.list <- sort(unique(train.list))
+detach(package:raster) # remove package to remove masking if the select comand from dplyr used later
+```
+
+The above code may be improved with better use of apply functions, but I haven't quite figured out how to get around it. Please do let me know if you have any suggestions :-)
+
+### Combine both datasets for plotting
+
+In order to visualise both types of data through leaflet, we will stack the data on top of each other. In order to do so, the column names between both datasets will have to be the same.
+
+```{r, dfviz, cache = TRUE}
+# merge the 2 datasets and label them according to the type
+library(dplyr)
+df1 <- select(school, POI=school, attrib=rank, latitude=lat, longitude=lon)
+df1$POI <- paste0("School name: ", df1$POI) # for labels later
+# df1$type <- as.factor("school")
+df1$type <- as.factor(as.character(ceiling(as.numeric(df1$attrib)/10)*10))
+df1$desc <- paste0("Public school rank: ", df1$attrib) # for labels later
+
+df2 <- select(train[train.list, ], POI=station, attrib=`line(s)`, latitude=lat, longitude=lon)
+df2$POI <- paste0("Train station: ", df2$POI) # for labels later
+df2$type <- as.factor("train")
+df2$desc <- paste0("Line(s): ",  df2$attrib) # for labels later
+  
+df <- rbind(df1, df2)
+rm(df1, df2)
+```
+
+### Creating icons
+
+To make it easier to differentiate schools from train stations visualised on the map, we will use different icons.
+
+```{r, icons, cache = TRUE}
+# Make a list of icons. We'll index into it based on name.
+library(leaflet)
+POIIcons <- iconList(
+  "10" = makeIcon("https://github.com/yimp/WSGeocodeMapviz/blob/gh-pages/school10.png?raw=true", iconWidth = 18, iconHeight = 18), # gold
+  "20" = makeIcon("https://github.com/yimp/WSGeocodeMapviz/blob/gh-pages/school20.png?raw=true", iconWidth = 18, iconHeight = 18), # silver
+  "30" = makeIcon("https://github.com/yimp/WSGeocodeMapviz/blob/gh-pages/school30.png?raw=true", iconWidth = 18, iconHeight = 18), # bronze
+  "40" = makeIcon("https://github.com/yimp/WSGeocodeMapviz/blob/gh-pages/school40.png?raw=true", iconWidth = 18, iconHeight = 18), # pink
+  "50" = makeIcon("https://github.com/yimp/WSGeocodeMapviz/blob/gh-pages/school50.png?raw=true", iconWidth = 18, iconHeight = 18), # purple
+  train = makeIcon("https://github.com/yimp/WSGeocodeMapviz/blob/gh-pages/train.png?raw=true", iconWidth = 18, iconHeight = 18)
+)
+```
+
+We will also create a legend for the icons, to be overlaid on the leaflet map.
+
+```{r, legend, cache = TRUE}
+# create a legend to be included in the leaflet map
+legend <- "<img src='https://github.com/yimp/WSGeocodeMapviz/blob/gh-pages/school10.png?raw=true' height='15' width='15'> 1st - 10th ranked school <br/>
+<img src='https://github.com/yimp/WSGeocodeMapviz/blob/gh-pages/school20.png?raw=true' height='15' width='15'> 11th - 20th ranked school <br/>
+<img src='https://github.com/yimp/WSGeocodeMapviz/blob/gh-pages/school30.png?raw=true' height='15' width='15'> 21st - 30th ranked school <br/>
+<img src='https://github.com/yimp/WSGeocodeMapviz/blob/gh-pages/school40.png?raw=true' height='15' width='15'> 31st - 40th ranked school <br/>
+<img src='https://github.com/yimp/WSGeocodeMapviz/blob/gh-pages/school50.png?raw=true' height='15' width='15'> 41st - 50th ranked school <br/>
+<img src='https://github.com/yimp/WSGeocodeMapviz/blob/gh-pages/train.png?raw=true' height='15' width='15'> train station <br/>
+"
+```
+
+### Plotting data
+
+Finally, we plot the formatted data using leaflet. We will also add some pop-up messages to enable interactivity with the points of interest.
+
+```{r, mapviz, cache = TRUE}
+suppressMessages(
+  leaflet(df) %>% addProviderTiles("CartoDB.Positron") %>% # addTiles() %>%
+  addMarkers(icon = ~POIIcons[type], 
+             popup = with(df, 
+                          paste(POI, "<br>",
+                           desc))) %>% 
+  addControl(html = legend, position = "bottomleft")
+)
+```
+
+
+Note that I've used a different tile to the default set from leaflet, as I personally felt that the existing colour scheme would be a distraction from the icons. For more information on the various tiles, please visit this [link](https://rstudio.github.io/leaflet/basemaps.html).
+
+## Other considerations
+
+This exercise is by no means an indication that all individuals prefer houses that are closer to schools and train stations. Some other considerations that some individuals look at:
+
+- **affordability**: this has to tie in with the individual's budget constraints, and one may look for 'value for money' properties
+- **current lifestage**: Depending on the lifestage of an individual, one might not care too much about schooling if they can save up in the interim and send their kids to private schools, or consider lower ranked schools that have prospects of performing well in the future
+- **future development opportunities**: some suburbs may be undergoing development to improve amenities e.g. public transportation
+- **lifestyle**: specific suburbs may offer certain types of lifestyles e.g. a suburb with lots of brunch cafes
+- **demographics**: individuals wanting to 'belong' to others who are 'like' them e.g. racial, age demographic
